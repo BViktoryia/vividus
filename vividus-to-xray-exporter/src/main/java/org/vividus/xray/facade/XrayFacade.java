@@ -18,6 +18,7 @@ package org.vividus.xray.facade;
 
 import java.io.IOException;
 import java.util.List;
+import java.util.function.Supplier;
 
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -28,7 +29,10 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.vividus.jira.JiraFacade;
 import org.vividus.util.json.JsonPathUtils;
+import org.vividus.xray.databind.CucumberTestCaseSerializer;
 import org.vividus.xray.databind.ManualTestCaseSerializer;
+import org.vividus.xray.model.AbstractTestCase;
+import org.vividus.xray.model.CucumberTestCase;
 import org.vividus.xray.model.ManualTestCase;
 
 public class XrayFacade
@@ -42,7 +46,7 @@ public class XrayFacade
     private final ObjectMapper objectMapper;
 
     public XrayFacade(String projectKey, String assignee, List<String> editableStatuses, JiraFacade jiraFacade,
-            ManualTestCaseSerializer manualTestSerializer)
+            ManualTestCaseSerializer manualTestSerializer, CucumberTestCaseSerializer cucumberTestSerializer)
     {
         this.projectKey = projectKey;
         this.assignee = assignee;
@@ -50,29 +54,58 @@ public class XrayFacade
         this.jiraFacade = jiraFacade;
         this.objectMapper = new ObjectMapper()
                 .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
-                .registerModule(new SimpleModule().addSerializer(ManualTestCase.class, manualTestSerializer));
+                .registerModule(new SimpleModule().addSerializer(ManualTestCase.class, manualTestSerializer)
+                                                  .addSerializer(CucumberTestCase.class, cucumberTestSerializer));
     }
 
-    public String createTestCase(TestCaseParameters testCaseParameters) throws IOException
+    public String createTestCase(CucumberTestCaseParameters testCaseParameters) throws IOException
     {
-        String createTestRequest = objectMapper.writeValueAsString(createManualTest(testCaseParameters));
-        LOGGER.atInfo().addArgument(createTestRequest).log("Creating Test Case: {}");
+        return createTestCase(createCucumberTest(testCaseParameters));
+    }
+
+    public String createTestCase(ManualTestCaseParameters testCaseParameters) throws IOException
+    {
+        return createTestCase(createManualTest(testCaseParameters));
+    }
+
+    private <T extends AbstractTestCase> String createTestCase(AbstractTestCase testCase) throws IOException
+    {
+        String createTestRequest = objectMapper.writeValueAsString(testCase);
+        LOGGER.atInfo().addArgument(testCase::getType).addArgument(createTestRequest).log("Creating {} Test Case: {}");
         String response = jiraFacade.createIssue(createTestRequest);
         String issueKey = JsonPathUtils.getData(response, "$.key");
-        LOGGER.atInfo().addArgument(issueKey).log("Test with key {} has been created");
+        LOGGER.atInfo().addArgument(testCase::getType)
+                       .addArgument(issueKey)
+                       .log("{} Test with key {} has been created");
         return issueKey;
     }
 
-    public void updateTestCase(String testCaseKey, TestCaseParameters testCaseParameters)
+    public void updateTestCase(String testCaseKey, CucumberTestCaseParameters testCaseParameters)
+            throws IOException, NonEditableIssueStatusException
+    {
+        updateTestCase(testCaseKey, () -> createCucumberTest(testCaseParameters));
+    }
+
+    public void updateTestCase(String testCaseKey, ManualTestCaseParameters testCaseParameters)
+            throws IOException, NonEditableIssueStatusException
+    {
+        updateTestCase(testCaseKey, () -> createManualTest(testCaseParameters));
+    }
+
+    private <T extends AbstractTestCase> void updateTestCase(String testCaseKey, Supplier<T> testCaseFactory)
             throws IOException, NonEditableIssueStatusException
     {
         checkIfIssueEditable(testCaseKey);
-        String updateTestRequest = objectMapper.writeValueAsString(createManualTest(testCaseParameters));
-        LOGGER.atInfo().addArgument(testCaseKey)
+        AbstractTestCase testCase = testCaseFactory.get();
+        String updateTestRequest = objectMapper.writeValueAsString(testCase);
+        LOGGER.atInfo().addArgument(testCase::getType)
+                       .addArgument(testCaseKey)
                        .addArgument(updateTestRequest)
-                       .log("Updating Test Case with ID {}: {}");
+                       .log("Updating {} Test Case with ID {}: {}");
         jiraFacade.updateIssue(testCaseKey, updateTestRequest);
-        LOGGER.atInfo().addArgument(testCaseKey).log("Test with key {} has been updated");
+        LOGGER.atInfo().addArgument(testCase::getType)
+                       .addArgument(testCaseKey)
+                       .log("{} Test with key {} has been updated");
     }
 
     private void checkIfIssueEditable(String issueKey) throws IOException, NonEditableIssueStatusException
@@ -95,16 +128,33 @@ public class XrayFacade
         jiraFacade.createIssueLink(testCaseId, requirementId, linkType);
     }
 
-    private ManualTestCase createManualTest(TestCaseParameters testCaseParameters)
+    private ManualTestCase createManualTest(ManualTestCaseParameters testCaseParameters)
     {
-        ManualTestCase manualTest = new ManualTestCase();
-        manualTest.setProjectKey(projectKey);
-        manualTest.setAssignee(assignee);
-        manualTest.setSummary(testCaseParameters.getSummary());
-        manualTest.setLabels(testCaseParameters.getLabels());
-        manualTest.setComponents(testCaseParameters.getComponents());
+        ManualTestCase manualTest = createTestCase(ManualTestCase::new, testCaseParameters);
         manualTest.setManualTestSteps(testCaseParameters.getSteps());
         return manualTest;
+    }
+
+    private CucumberTestCase createCucumberTest(CucumberTestCaseParameters testCaseParameters)
+    {
+        CucumberTestCase cucumberTest = createTestCase(CucumberTestCase::new, testCaseParameters);
+        cucumberTest.setScenarioType(testCaseParameters.getScenarioType());
+        cucumberTest.setScenario(testCaseParameters.getScenario());
+        return cucumberTest;
+    }
+
+    @SuppressWarnings("unchecked")
+    private <T extends AbstractTestCase> T createTestCase(Supplier<T> testCaseFactory,
+            AbstractTestCaseParameters parameters)
+    {
+        AbstractTestCase testCase = testCaseFactory.get();
+        testCase.setType(parameters.getType().getValue());
+        testCase.setProjectKey(projectKey);
+        testCase.setAssignee(assignee);
+        testCase.setSummary(parameters.getSummary());
+        testCase.setLabels(parameters.getLabels());
+        testCase.setComponents(parameters.getComponents());
+        return (T) testCase;
     }
 
     public static final class NonEditableIssueStatusException extends Exception

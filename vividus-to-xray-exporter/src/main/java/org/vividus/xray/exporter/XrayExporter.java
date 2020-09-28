@@ -24,8 +24,10 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
@@ -42,13 +44,19 @@ import org.vividus.bdd.model.jbehave.Meta;
 import org.vividus.bdd.model.jbehave.Scenario;
 import org.vividus.bdd.model.jbehave.Story;
 import org.vividus.xray.configuration.XrayExporterOptions;
+import org.vividus.xray.converter.CucumberScenarioConverter;
+import org.vividus.xray.converter.CucumberScenarioConverter.CucumberScenario;
 import org.vividus.xray.converter.ManualStepConverter;
 import org.vividus.xray.exception.SyntaxException;
-import org.vividus.xray.facade.TestCaseParameters;
+import org.vividus.xray.facade.AbstractTestCaseParameters;
+import org.vividus.xray.facade.CucumberTestCaseParameters;
+import org.vividus.xray.facade.ManualTestCaseParameters;
 import org.vividus.xray.facade.XrayFacade;
 import org.vividus.xray.facade.XrayFacade.NonEditableIssueStatusException;
+import org.vividus.xray.model.TestCaseType;
 import org.vividus.xray.reader.JsonResourceReader;
 import org.vividus.xray.reader.JsonResourceReader.FileEntry;
+import org.vividus.xray.util.StoryUtils;
 
 @Component
 public class XrayExporter
@@ -62,13 +70,28 @@ public class XrayExporter
 
     private final List<ErrorExportEntry> errors = new ArrayList<>();
 
+    private final Map<TestCaseType, UpdateConsumer> updateFactory = Map.of(
+        TestCaseType.MANUAL, (tci, params) -> xrayFacade.updateTestCase(tci, (ManualTestCaseParameters) params),
+        TestCaseType.CUCUMBER, (tci, params) -> xrayFacade.updateTestCase(tci, (CucumberTestCaseParameters) params)
+    );
+
+    private final Map<TestCaseType, CreateFunction> createFactory = Map.of(
+        TestCaseType.MANUAL, params -> xrayFacade.createTestCase((ManualTestCaseParameters) params),
+        TestCaseType.CUCUMBER, params -> xrayFacade.createTestCase((CucumberTestCaseParameters) params)
+    );
+
+    private final Map<TestCaseType, CreateParametersFunction> parametersFactory = Map.of(
+        TestCaseType.MANUAL, this::createManualTestCaseParameters,
+        TestCaseType.CUCUMBER, (title, scenario) -> createCucumberTestCaseParameters(scenario)
+    );
+
     public void exportResults() throws IOException
     {
         for (Story story : readStories())
         {
             LOGGER.atInfo().addArgument(story::getPath).log("Exporting scenarios from {} story");
 
-            for (Scenario scenario : story.getScenarios())
+            for (Scenario scenario : StoryUtils.getFoldScenarios(story))
             {
                 exportScenario(story.getPath(), scenario);
             }
@@ -91,16 +114,19 @@ public class XrayExporter
 
         try
         {
-            TestCaseParameters parameters = createTestCaseParameters(storyTitle, scenario);
+            TestCaseType testCaseType = TestCaseType.getTestCaseType(scenario);
+            CreateParametersFunction parameters = parametersFactory.get(testCaseType);
 
             String testCaseId = ensureOneValueOrNull(scenarioMeta, "testCaseId");
             if (testCaseId != null)
             {
-                xrayFacade.updateTestCase(testCaseId, parameters);
+                updateFactory.get(testCaseType)
+                             .accept(testCaseId, parameters.apply(storyTitle, scenario));
             }
             else
             {
-                testCaseId = xrayFacade.createTestCase(parameters);
+                testCaseId = createFactory.get(testCaseType)
+                                          .apply(parameters.apply(storyTitle, scenario));
             }
             createTestsLink(testCaseId, scenarioMeta);
         }
@@ -111,17 +137,36 @@ public class XrayExporter
         }
     }
 
-    private TestCaseParameters createTestCaseParameters(String storyTitle, Scenario scenario) throws SyntaxException
+    private ManualTestCaseParameters createManualTestCaseParameters(String storyTitle, Scenario scenario)
+            throws SyntaxException
     {
-        String scenarioTitle = scenario.getTitle();
-        List<Meta> scenarioMeta = scenario.getMeta();
+        ManualTestCaseParameters parameters = createTestCaseParameters(TestCaseType.MANUAL, scenario,
+                ManualTestCaseParameters::new);
+        parameters.setSteps(ManualStepConverter.convert(storyTitle, scenario.getTitle(), scenario.collectSteps()));
+        return parameters;
+    }
 
-        TestCaseParameters parameters = new TestCaseParameters();
+    private CucumberTestCaseParameters createCucumberTestCaseParameters(Scenario scenario) throws SyntaxException
+    {
+        CucumberTestCaseParameters parameters = createTestCaseParameters(TestCaseType.CUCUMBER, scenario,
+                CucumberTestCaseParameters::new);
+        CucumberScenario cucumberScenario = CucumberScenarioConverter.convert(scenario);
+        parameters.setScenarioType(cucumberScenario.getType());
+        parameters.setScenario(cucumberScenario.getScenario());
+        return parameters;
+    }
+
+    @SuppressWarnings("unchecked")
+    private <T extends AbstractTestCaseParameters> T createTestCaseParameters(TestCaseType type, Scenario scenario,
+            Supplier<T> parametersFactory)
+    {
+        AbstractTestCaseParameters parameters = parametersFactory.get();
+        List<Meta> scenarioMeta = scenario.getMeta();
+        parameters.setType(type);
         parameters.setLabels(getMetaValues(scenarioMeta, "xray.labels"));
         parameters.setComponents(getMetaValues(scenarioMeta, "xray.components"));
-        parameters.setSummary(scenarioTitle);
-        parameters.setSteps(ManualStepConverter.convert(storyTitle, scenarioTitle, scenario.collectSteps()));
-        return parameters;
+        parameters.setSummary(scenario.getTitle());
+        return (T) parameters;
     }
 
     private void publishErrors()
@@ -251,5 +296,24 @@ public class XrayExporter
         {
             return error;
         }
+    }
+
+    @FunctionalInterface
+    private interface UpdateConsumer
+    {
+        void accept(String testCaseKey, AbstractTestCaseParameters parameters)
+                throws IOException, NonEditableIssueStatusException;
+    }
+
+    @FunctionalInterface
+    private interface CreateFunction
+    {
+        String apply(AbstractTestCaseParameters parameters) throws IOException;
+    }
+
+    @FunctionalInterface
+    private interface CreateParametersFunction
+    {
+        AbstractTestCaseParameters apply(String title, Scenario scenario) throws SyntaxException;
     }
 }
